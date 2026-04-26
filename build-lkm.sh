@@ -23,10 +23,10 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TEMP_DIR="${SCRIPT_DIR}/.tmp_build"
 RELEASES_DIR="${SCRIPT_DIR}/releases"
 BUILD_TEMP="${TEMP_DIR}/build"
-STAGING_DIR="${TEMP_DIR}/staging"
 
 # Configuration
 VERSION=""
+TARGET=""          # Single build target: dev or prod (set via --target flag)
 BUILD_ALL=false
 INTERACTIVE_MODE=false
 
@@ -58,14 +58,16 @@ ${GREEN}Usage:${NC} $0 [OPTIONS]
 
 ${GREEN}Options:${NC}
   -v, --version VERSION   DSM/Toolkit version (7.1, 7.2, 7.3)
-  -a, --all               Build all versions (prod and dev)
+  -t, --target  TARGET    Build target: dev or prod (default: both)
+  -a, --all               Build all versions and both targets
   -h, --help              Show this help message
 
 ${GREEN}Examples:${NC}
-  $0 -v 7.2               Build 7.2 (prod and dev)
-  $0 --version 7.3        Build 7.3 (prod and dev)
-  $0 --all                Build all versions
-  $0                      Interactive mode
+  $0 -v 7.2                    Build 7.2 (dev + prod)
+  $0 -v 7.2 -t dev             Build 7.2 dev only
+  $0 -v 7.3 -t prod            Build 7.3 prod only
+  $0 --all                     Build all versions (dev + prod)
+  $0                           Interactive mode
 
 EOF
 }
@@ -76,6 +78,10 @@ parse_args() {
     case $1 in
       -v|--version)
         VERSION="$2"
+        shift 2
+        ;;
+      -t|--target)
+        TARGET="$2"
         shift 2
         ;;
       -a|--all)
@@ -109,31 +115,48 @@ interactive_mode() {
     read -p "Select version (1-3, or enter version number): " VERSION_INPUT
 
     case "$VERSION_INPUT" in
-      1)         VERSION="7.2" ;;
-      2)         VERSION="7.3" ;;
-      3)         BUILD_ALL=true ;;
-      7.[0-9])   VERSION="$VERSION_INPUT" ;;
-      *)         log_error "Invalid selection"; exit 1 ;;
+      1)        VERSION="7.2" ;;
+      2)        VERSION="7.3" ;;
+      3)        BUILD_ALL=true ;;
+      7.[0-9])  VERSION="$VERSION_INPUT" ;;
+      *)        log_error "Invalid selection"; exit 1 ;;
     esac
-
-    INTERACTIVE_MODE=true
   fi
+
+  # When running interactively without --target, always build both targets
+  if [ -z "$TARGET" ]; then
+    TARGET=""
+  fi
+
+  INTERACTIVE_MODE=true
 }
 
-# Validate that the requested DSM version is supported
+# Validate that the requested DSM version and target are supported
 validate_inputs() {
   if [[ ! "$VERSION" =~ ^7\.[0-9]$ ]]; then
     log_error "Invalid version: $VERSION"
     exit 1
   fi
+
+  if [ -n "$TARGET" ] && [[ "$TARGET" != "dev" && "$TARGET" != "prod" ]]; then
+    log_error "Invalid target: $TARGET (must be 'dev' or 'prod')"
+    exit 1
+  fi
 }
 
-# Build LKM modules for all platforms using the specified DSM version
+# Build LKM modules for all platforms.
+# When TARGET is set, only that target is built (used by CI matrix jobs).
+# When TARGET is empty, both dev and prod are built sequentially (local use).
 build_lkms() {
   local version=$1
 
   log_info "Starting LKM Build"
   log_info "Version: $version"
+  if [ -n "$TARGET" ]; then
+    log_info "Target:  $TARGET (single-target mode)"
+  else
+    log_info "Target:  dev + prod (both)"
+  fi
   echo ""
 
   mkdir -p "$RELEASES_DIR"
@@ -145,23 +168,33 @@ build_lkms() {
 
   local -a platforms=("${PLATFORMS[@]}")
 
-  log_info "Building for ${#platforms[@]} platforms (dev + prod)"
+  # Determine which targets to build for this run
+  local -a targets=()
+  if [ -n "$TARGET" ]; then
+    # Single-target mode: used when called from a CI matrix job (--target dev/prod)
+    targets=("$TARGET")
+  else
+    # Both-target mode: used for local builds without --target
+    targets=("dev" "prod")
+  fi
+
+  log_info "Building for ${#platforms[@]} platforms x ${#targets[@]} target(s)"
   echo ""
 
-  # Pull Docker image once before the build loop to avoid per-run layer checks
+  # Pull Docker image once before the loop to avoid per-container layer checks
   log_info "Pre-pulling Docker image: auxxxilium/syno-compiler:${version}"
   docker pull "auxxxilium/syno-compiler:${version}"
   echo ""
 
-  # Iterate over each platform and build both dev and prod targets
+  # Iterate over each platform and each assigned target
   for ENTRY in "${platforms[@]}"; do
     local PLATFORM="${ENTRY%%:*}"
     local KERNEL_VER="${ENTRY##*:}"
 
-    for TARGET in dev prod; do
-      log_info "Compiling: ${PLATFORM} (kernel ${KERNEL_VER}) - ${TARGET}"
+    for BUILD_TARGET in "${targets[@]}"; do
+      log_info "Compiling: ${PLATFORM} (kernel ${KERNEL_VER}) - ${BUILD_TARGET}"
 
-      local PLATFORM_BUILD_DIR="${BUILD_TEMP}/${PLATFORM}-${version}-${TARGET}"
+      local PLATFORM_BUILD_DIR="${BUILD_TEMP}/${PLATFORM}-${version}-${BUILD_TARGET}"
       mkdir -p "$PLATFORM_BUILD_DIR"
       chmod 777 "$PLATFORM_BUILD_DIR"
 
@@ -172,7 +205,7 @@ build_lkms() {
         -v "${SCRIPT_DIR}":/input \
         -v "${PLATFORM_BUILD_DIR}":/output \
         "auxxxilium/syno-compiler:${version}" \
-        compile-lkm "${PLATFORM}" "${TARGET}" 2>&1) || docker_exit_code=$?
+        compile-lkm "${PLATFORM}" "${BUILD_TARGET}" 2>&1) || docker_exit_code=$?
 
       if [ $docker_exit_code -eq 0 ]; then
         echo "$docker_output" | sed 's/^/  /'
@@ -182,7 +215,7 @@ build_lkms() {
 
         if [ -f "${FILE_KO}" ]; then
           mkdir -p "$RELEASES_DIR"
-          local OUTPUT_FILE="${RELEASES_DIR}/rp-${PLATFORM}-${version}-${KERNEL_VER}-${TARGET}.ko.gz"
+          local OUTPUT_FILE="${RELEASES_DIR}/rp-${PLATFORM}-${version}-${KERNEL_VER}-${BUILD_TARGET}.ko.gz"
 
           # Fix ownership/permissions that may be set by the container
           chmod 644 "${FILE_KO}" 2>/dev/null || sudo chmod 644 "${FILE_KO}" 2>/dev/null || true
@@ -191,26 +224,26 @@ build_lkms() {
           if gzip -9 -c "${FILE_KO}" > "${OUTPUT_FILE}"; then
             local SIZE
             SIZE=$(du -h "${OUTPUT_FILE}" | awk '{print $1}')
-            log_info "OK Created: ${PLATFORM}-${version}-${KERNEL_VER}-${TARGET} (${SIZE})"
+            log_info "OK  Created: ${PLATFORM}-${version}-${KERNEL_VER}-${BUILD_TARGET} (${SIZE})"
             ((SUCCESSFUL++))
             FOUND=1
           else
-            log_error "FAIL Failed to gzip redpill.ko for ${PLATFORM}-${TARGET}"
+            log_error "FAIL Failed to gzip redpill.ko for ${PLATFORM}-${BUILD_TARGET}"
           fi
         else
           log_warn "WARN ${PLATFORM}/redpill.ko not found at ${FILE_KO}"
         fi
 
         if [ $FOUND -eq 0 ]; then
-          log_error "FAIL No redpill module found for ${PLATFORM}-${TARGET}"
+          log_error "FAIL No redpill module found for ${PLATFORM}-${BUILD_TARGET}"
           ((FAILED++))
-          FAILED_PLATFORMS+=("$PLATFORM-$TARGET")
+          FAILED_PLATFORMS+=("$PLATFORM-$BUILD_TARGET")
         fi
       else
         echo "$docker_output" | sed 's/^/  /'
-        log_error "FAIL Docker compilation failed for ${PLATFORM}-${TARGET}"
+        log_error "FAIL Docker compilation failed for ${PLATFORM}-${BUILD_TARGET}"
         ((FAILED++))
-        FAILED_PLATFORMS+=("$PLATFORM-$TARGET")
+        FAILED_PLATFORMS+=("$PLATFORM-$BUILD_TARGET")
       fi
 
       # Remove per-platform build directory immediately to conserve disk space
@@ -219,7 +252,7 @@ build_lkms() {
   done
 
   echo ""
-  local TOTAL_BUILDS=$(( ${#platforms[@]} * 2 ))  # 2 targets (dev + prod) per platform
+  local TOTAL_BUILDS=$(( ${#platforms[@]} * ${#targets[@]} ))
   log_info "=== Build Summary ==="
   log_info "Successful: $SUCCESSFUL/$TOTAL_BUILDS"
   log_info "Failed:     $FAILED/$TOTAL_BUILDS"
@@ -253,15 +286,15 @@ finalize_release() {
   if [ -f "$ZIP_PATH" ]; then
     local SIZE
     SIZE=$(du -h "$ZIP_PATH" | awk '{print $1}')
-    log_info "OK Successfully created: $ZIP_PATH"
-    log_info "   Size: ${SIZE}"
+    log_info "OK  Successfully created: $ZIP_PATH"
+    log_info "    Size: ${SIZE}"
   else
     log_error "Failed to create zip file"
     return 1
   fi
 }
 
-# Build all supported DSM versions sequentially
+# Build all supported DSM versions (both targets each)
 build_all() {
   log_info "Building all versions..."
   echo ""
