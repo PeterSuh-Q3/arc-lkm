@@ -42,16 +42,18 @@ jobs:
   build:
     runs-on: ubuntu-latest
     strategy:
+      # Matrix expands to 4 parallel jobs: 7.2-dev, 7.2-prod, 7.3-dev, 7.3-prod
       matrix:
-        dsm_version: ['7.2', '7.3']    # Parallel builds per DSM version
+        dsm_version: ['7.2', '7.3']
+        target: ['dev', 'prod']
       fail-fast: false
 
     steps:
-      # Skip this matrix entry if a specific version was requested and it does not match
+      # Skip this matrix entry if a specific DSM version was requested and it does not match
       - name: Skip if version mismatch
         if: inputs.target_version != 'all' && inputs.target_version != matrix.dsm_version
         run: |
-          echo "Skipping DSM ${{ matrix.dsm_version }} (target: ${{ inputs.target_version }})"
+          echo "Skipping DSM ${{ matrix.dsm_version }}-${{ matrix.target }} (target: ${{ inputs.target_version }})"
           exit 0
 
       # Free up disk space before build to avoid out-of-disk failures
@@ -70,7 +72,7 @@ jobs:
           git config --global user.name "AuxXxilium"
           sudo timedatectl set-timezone "Europe/Berlin"
 
-      # Cache the Docker compiler image to avoid repeated pulls on re-runs
+      # Cache Docker image per DSM version (shared between dev and prod of the same version)
       - name: Cache Docker Image
         id: docker-cache
         if: inputs.use_cache != 'disabled'
@@ -103,11 +105,11 @@ jobs:
             fi
           fi
 
-      # Run build script for this specific DSM version only (parallel, not sequential)
+      # Build only the single target (dev or prod) assigned to this matrix job
       - name: Build LKMs
         run: |
           chmod +x ./build-lkm.sh
-          ./build-lkm.sh --version ${{ matrix.dsm_version }}
+          ./build-lkm.sh --version ${{ matrix.dsm_version }} --target ${{ matrix.target }}
 
       - name: Calculate Version
         run: |
@@ -127,14 +129,14 @@ jobs:
             echo "VERSION=${VERSION}" >> $GITHUB_ENV
           fi
 
-      # Upload per-version artifacts so the release job can collect them all
+      # Upload artifacts namespaced by version+target so all 4 jobs stay separate
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: rp-lkms-${{ matrix.dsm_version }}
+          name: rp-lkms-${{ matrix.dsm_version }}-${{ matrix.target }}
           path: releases/*.ko.gz
 
-  # Release job runs after all matrix build jobs complete
+  # Release job runs only after all 4 matrix build jobs complete successfully
   release:
     runs-on: ubuntu-latest
     needs: build
@@ -144,7 +146,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Collect .ko.gz artifacts from all matrix builds
+      # Collect .ko.gz artifacts from all 4 matrix builds (7.2-dev, 7.2-prod, 7.3-dev, 7.3-prod)
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
